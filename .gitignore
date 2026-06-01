@@ -1,0 +1,5 @@
+build/
+test_data/
+*.o
+*.out
+core
