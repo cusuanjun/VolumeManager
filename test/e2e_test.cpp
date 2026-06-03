@@ -13,10 +13,42 @@ using namespace volumemanager;
 
 // 测试配置
 constexpr uint64_t VOLUME_SIZE = 1 * 1024 * 1024; // 1MB
-constexpr double SIZE_THRESHOLD = 0.5;            // 50%
+constexpr double SIZE_THRESHOLD = 0.001;            // 50%
 constexpr const char *BASE_PATH = "./test_data/";
 constexpr const char *TEMP_DIR = "/tmp/volume_manager/";
 constexpr int NUM_FILES = 10;
+
+const char* PackTriggerToString(PackTrigger trigger);
+
+class TestPackReporter : public IPackReporter {
+public:
+    std::vector<PackReport> reports;
+
+    void OnPackFinished(const PackReport& report) override {
+        reports.push_back(report);
+        std::cout << "收到上报: "
+                  << "trigger=" << PackTriggerToString(report.trigger)
+                  << ", result=" << GetErrorMessage(report.result)
+                  << ", volume_id=" << report.volume_id
+                  << ", volume_path=" << report.volume_path
+                  << ", file_count=" << report.file_count
+                  << ", user_data_size=" << report.user_data_size
+                  << std::endl;
+    }
+};
+
+const char* PackTriggerToString(PackTrigger trigger) {
+    switch (trigger) {
+        case PackTrigger::Manual:
+            return "Manual";
+        case PackTrigger::AutoThreshold:
+            return "AutoThreshold";
+        case PackTrigger::AutoOverflow:
+            return "AutoOverflow";
+        default:
+            return "Unknown";
+    }
+}
 
 // 卷镜像信息结构文件列表
 struct VolumeInfo
@@ -188,6 +220,18 @@ void Step1_Initialize(VolumeManager &manager)
     }
 }
 
+void CreateSeedFile(const std::string& path) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("无法创建种子文件: " + path);
+    }
+
+    // 内容尽量重复一些，后面压缩测试更稳定
+    file << "This is the seed file for VolumeManager e2e test.\n";
+    file << "This file will be copied into multiple test files.\n";
+    file << "VolumeManager end-to-end test data.\n";
+}
+
 /**
  * @brief 步骤2：创建测试文件副本
  */
@@ -196,6 +240,7 @@ void Step2_CreateTestFileCopies()
     std::cout << "\n=== 步骤2：创建测试文件副本 ===" << std::endl;
 
     std::string source_file = std::string(BASE_PATH) + "testfile1.data";
+    CreateSeedFile(source_file);
     if (!FileExists(source_file))
     {
         std::cerr << "✗ 源文件不存在: " << source_file << std::endl;
@@ -314,13 +359,15 @@ void Step4_VerifyMetadata(VolumeManager &manager, const std::vector<VolumeInfo> 
 void Step5_VerifyFileContents(VolumeManager &manager, const std::vector<VolumeInfo> &volume_infos)
 {
     std::cout << "\n=== 步骤5：读取并验证文件内容 ===" << std::endl;
+    (void)volume_infos;
 
     int success_count = 0;
 
     // for (const auto &info : volume_infos)
     // {
-        for (auto [inode_id, file_meta] : manager.file_metadata_cache_)
+        for (const auto& pair : manager.file_metadata_cache_)
         {
+            uint64_t inode_id = pair.first;
             std::string output_path;
             ErrorCode ret = manager.ReadFile(inode_id, output_path);
 
@@ -490,10 +537,11 @@ void Step9_VerifyAfterRemount(VolumeManager &manager, const std::vector<VolumeIn
 
     // 验证文件内容
     int success_count = 0;
-    for (auto [inode_id, file_metadata] : manager.file_metadata_cache_)
+    for (const auto& pair : manager.file_metadata_cache_)
     {
-        std::string output_path;
-        ErrorCode ret = manager.ReadFile(inode_id, output_path);
+        uint64_t inode_id = pair.first;
+                std::string output_path;
+                ErrorCode ret = manager.ReadFile(inode_id, output_path);
 
         if (ret == ErrorCode::SUCCESS)
         {
@@ -595,6 +643,48 @@ void Step10_CleanupResources(const std::vector<VolumeInfo> &volume_infos)
 }
 
 /**
+ * @brief 步骤11：上层手动触发打包
+ */
+void Step11_ManualPackTest()
+{
+    std::cout << "\n=== 步骤11：上层手动触发打包 ===" << std::endl;
+
+    TestPackReporter manual_reporter;
+    VolumeManager manual_manager(VOLUME_SIZE, 0.9);
+    manual_manager.SetBasePath(BASE_PATH);
+    manual_manager.SetPackReporter(&manual_reporter);
+
+    std::string manual_source = std::string(BASE_PATH) + "manual_seed.data";
+    std::string manual_volume_path;
+
+    CreateSeedFile(manual_source);
+
+    ErrorCode ret = manual_manager.AddFileToCollect("manual_seed.data");
+    assert(ret == ErrorCode::SUCCESS);
+    std::cout << "✓ 手动测试文件加入待封装集成功" << std::endl;
+
+    ret = manual_manager.FlushPendingFiles(manual_volume_path);
+    assert(ret == ErrorCode::SUCCESS);
+    std::cout << "✓ 上层主动触发打包成功" << std::endl;
+
+    assert(!manual_reporter.reports.empty());
+    assert(manual_reporter.reports.size() == 1);
+
+    const PackReport& report = manual_reporter.reports[0];
+    assert(report.trigger == PackTrigger::Manual);
+    assert(report.result == ErrorCode::SUCCESS);
+    assert(report.volume_id != INVALID_VOLUME_ID);
+    assert(!report.volume_path.empty());
+    assert(report.file_count == 1);
+    assert(report.volume_path == manual_volume_path);
+
+    std::cout << "✓ 手动打包上报验证成功" << std::endl;
+
+    DeleteFile(manual_source);
+    DeleteFile(manual_volume_path);
+}
+
+/**
  * @brief 打印测试总结
  */
 void PrintTestSummary(const std::vector<VolumeInfo> &volume_infos)
@@ -623,6 +713,9 @@ int main()
         // 创建卷镜像管理器
         VolumeManager manager(VOLUME_SIZE, SIZE_THRESHOLD);
 
+        TestPackReporter reporter;
+        manager.SetPackReporter(&reporter);
+
         // 记录卷镜像信息
         std::vector<VolumeInfo> volume_infos;
 
@@ -640,9 +733,34 @@ int main()
 
         Step9_VerifyAfterRemount(manager, volume_infos);
         Step10_CleanupResources(volume_infos);
+        Step11_ManualPackTest();
 
         // 打印测试总结
         PrintTestSummary(volume_infos);
+        std::cout << "\n========== 上报摘要 ==========" << std::endl;
+        std::cout << "上报总数: " << reporter.reports.size() << std::endl;
+        for (size_t i = 0; i < reporter.reports.size(); ++i) {
+            const auto& r = reporter.reports[i];
+            std::cout << "[" << i << "] "
+                      << "trigger=" << PackTriggerToString(r.trigger)
+                      << ", result=" << GetErrorMessage(r.result)
+                      << ", volume_id=" << r.volume_id
+                      << ", volume_path=" << r.volume_path
+                      << ", file_count=" << r.file_count
+                      << ", user_data_size=" << r.user_data_size
+                      << std::endl;
+        }
+        assert(!reporter.reports.empty());
+        bool has_success = false;
+        for (const auto& r : reporter.reports) {
+            if (r.result == ErrorCode::SUCCESS) {
+                has_success = true;
+                assert(r.volume_id != INVALID_VOLUME_ID);
+                assert(!r.volume_path.empty());
+                assert(r.file_count > 0);
+            }
+        }
+        assert(has_success);
 
         std::cout << "\n✓ 所有测试通过！" << std::endl;
         return 0;

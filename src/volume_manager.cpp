@@ -24,6 +24,7 @@ ErrorCode ReadFileContent(const std::string& path, std::vector<uint8_t>& content
 ErrorCode WriteFileContent(const std::string& path, const std::vector<uint8_t>& content);
 ErrorCode DeleteFile(const std::string& path);
 
+
 VolumeManager::VolumeManager(uint64_t volume_size, double size_threshold)
     : base_path_("./")
     , temp_dir_("/tmp/volume_manager/")
@@ -47,6 +48,129 @@ VolumeManager::~VolumeManager() {
     }
     mounted_volumes_.clear();
     file_metadata_cache_.clear();
+}
+
+void VolumeManager::SetPackReporter(IPackReporter* reporter) {
+    pack_reporter_ = reporter;
+}
+
+ErrorCode VolumeManager::FlushPendingFiles(std::string& output_path) {
+    return PackVolumeInternal(PackTrigger::Manual, output_path);
+}
+
+ErrorCode VolumeManager::PackVolumeInternal(PackTrigger trigger, std::string& output_path)
+{
+        if (pending_files_.empty()) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    // 准备卷镜像元数据
+    VolumeMetadata volume_meta;
+    volume_meta.volume_id = GenerateVolumeId();
+    volume_meta.volume_size = volume_size_;
+    volume_meta.file_count = static_cast<uint32_t>(pending_files_.size());
+
+    // 计算各数据区大小
+    uint32_t metadata_offset = 56; // 卷镜像头固定大小56字节
+    uint32_t metadata_size = 0;
+
+    // 计算元数据区大小
+    for (auto& file_meta : pending_files_) {
+        std::vector<uint8_t> serialized;
+        file_meta.volume_id = volume_meta.volume_id;
+        Serializer::SerializeFileMetadata(file_meta, serialized);
+        metadata_size += static_cast<uint32_t>(serialized.size());
+    }
+
+    uint32_t directory_offset = metadata_offset + metadata_size;
+    uint32_t directory_size = 0; // 暂不处理目录数据
+    uint32_t user_data_offset = directory_offset + directory_size;
+    uint32_t user_data_size = 0;
+
+    // 计算用户数据区大小并设置偏移（使用压缩后大小）
+    for (auto& file_meta : pending_files_) {
+        file_meta.offset_in_volume = user_data_offset + user_data_size;
+        user_data_size += static_cast<uint32_t>(file_meta.compressed_size);
+    }
+
+    // 设置卷镜像元数据
+    volume_meta.metadata_offset = metadata_offset;
+    volume_meta.metadata_size = metadata_size;
+    volume_meta.directory_offset = directory_offset;
+    volume_meta.directory_size = directory_size;
+    volume_meta.user_data_offset = user_data_offset;
+    volume_meta.user_data_size = user_data_size;
+
+    // 生成卷镜像文件路径
+    output_path = temp_dir_ + "volume_" + std::to_string(volume_meta.volume_id) + ".vimg";
+
+    // 打开文件进行写入
+    std::ofstream file(output_path, std::ios::binary);
+    if (!file.is_open()) {
+        return ErrorCode::IO_ERROR;
+    }
+
+    // 序列化并写入卷镜像头
+    std::vector<uint8_t> volume_data;
+    ErrorCode ret = Serializer::SerializeVolumeMetadata(volume_meta, volume_data);
+    if (ret != ErrorCode::SUCCESS) {
+        file.close();
+        return ret;
+    }
+    file.write(reinterpret_cast<const char*>(volume_data.data()), volume_data.size());
+
+    // 写入文件元数据区
+    for (const auto& file_meta : pending_files_) {
+        std::vector<uint8_t> file_data;
+        Serializer::SerializeFileMetadata(file_meta, file_data);
+        file.write(reinterpret_cast<const char*>(file_data.data()), file_data.size());
+
+        // 更新缓存中的文件元数据（volume_id和offset）
+        if (file_metadata_cache_.find(file_meta.inode_id) != file_metadata_cache_.end()) {
+            file_metadata_cache_[file_meta.inode_id].volume_id = volume_meta.volume_id;
+            file_metadata_cache_[file_meta.inode_id].offset_in_volume = file_meta.offset_in_volume;
+        }
+    }
+
+    // 写入目录数据区（空）
+    // 写入用户数据区（使用压缩后的数据）
+    for (const auto& file_meta : pending_files_) {
+        // 读取临时压缩文件内容
+        std::string temp_compressed_path = temp_dir_ + "temp_" + std::to_string(file_meta.inode_id) + ".compressed";
+        std::vector<uint8_t> content;
+        ret = ReadFileContent(temp_compressed_path, content);
+        if (ret != ErrorCode::SUCCESS) {
+            file.close();
+            return ret;
+        }
+
+        // 写入到卷镜像
+        file.write(reinterpret_cast<const char*>(content.data()), content.size());
+
+        // 删除临时压缩文件
+        DeleteFile(temp_compressed_path);
+    }
+
+    file.close();
+
+    // 挂载新创建的卷镜像
+    mounted_volumes_[volume_meta.volume_id] = volume_meta;
+
+    // 清空待封装文件集
+    pending_files_.clear();
+    pending_size_ = 0;
+
+    if (pack_reporter_) {
+    PackReport report;
+    report.trigger = trigger;
+    report.result = ret;
+    report.volume_id = volume_meta.volume_id;
+    report.volume_path = output_path;
+    report.file_count = volume_meta.file_count;
+    report.user_data_size = volume_meta.user_data_size;
+    pack_reporter_->OnPackFinished(report);
+}
+    return ErrorCode::SUCCESS;
 }
 
 ErrorCode VolumeManager::InitializeTempDir() {
@@ -163,7 +287,7 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     if (pending_size_ + metadata.compressed_size > volume_size_) {
         // 先封装当前待封装文件集
         std::string volume_path;
-        ErrorCode ret = PackVolume(volume_path);
+        ErrorCode ret = PackVolumeInternal(PackTrigger::AutoOverflow, volume_path);
         if (ret != ErrorCode::SUCCESS) {
             return ret;
         }
@@ -179,114 +303,14 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     // 检查是否需要封装卷镜像
     if (ShouldPackVolume()) {
         std::string volume_path;
-        return PackVolume(volume_path);
+        return PackVolumeInternal(PackTrigger::AutoThreshold, volume_path);
     }
 
     return ErrorCode::SUCCESS;
 }
 
 ErrorCode VolumeManager::PackVolume(std::string& output_path) {
-    if (pending_files_.empty()) {
-        return ErrorCode::INVALID_PARAMETER;
-    }
-
-    // 准备卷镜像元数据
-    VolumeMetadata volume_meta;
-    volume_meta.volume_id = GenerateVolumeId();
-    volume_meta.volume_size = volume_size_;
-    volume_meta.file_count = static_cast<uint32_t>(pending_files_.size());
-
-    // 计算各数据区大小
-    uint32_t metadata_offset = 56; // 卷镜像头固定大小56字节
-    uint32_t metadata_size = 0;
-
-    // 计算元数据区大小
-    for (auto& file_meta : pending_files_) {
-        std::vector<uint8_t> serialized;
-        file_meta.volume_id = volume_meta.volume_id;
-        Serializer::SerializeFileMetadata(file_meta, serialized);
-        metadata_size += static_cast<uint32_t>(serialized.size());
-    }
-
-    uint32_t directory_offset = metadata_offset + metadata_size;
-    uint32_t directory_size = 0; // 暂不处理目录数据
-    uint32_t user_data_offset = directory_offset + directory_size;
-    uint32_t user_data_size = 0;
-
-    // 计算用户数据区大小并设置偏移（使用压缩后大小）
-    for (auto& file_meta : pending_files_) {
-        file_meta.offset_in_volume = user_data_offset + user_data_size;
-        user_data_size += static_cast<uint32_t>(file_meta.compressed_size);
-    }
-
-    // 设置卷镜像元数据
-    volume_meta.metadata_offset = metadata_offset;
-    volume_meta.metadata_size = metadata_size;
-    volume_meta.directory_offset = directory_offset;
-    volume_meta.directory_size = directory_size;
-    volume_meta.user_data_offset = user_data_offset;
-    volume_meta.user_data_size = user_data_size;
-
-    // 生成卷镜像文件路径
-    output_path = temp_dir_ + "volume_" + std::to_string(volume_meta.volume_id) + ".vimg";
-
-    // 打开文件进行写入
-    std::ofstream file(output_path, std::ios::binary);
-    if (!file.is_open()) {
-        return ErrorCode::IO_ERROR;
-    }
-
-    // 序列化并写入卷镜像头
-    std::vector<uint8_t> volume_data;
-    ErrorCode ret = Serializer::SerializeVolumeMetadata(volume_meta, volume_data);
-    if (ret != ErrorCode::SUCCESS) {
-        file.close();
-        return ret;
-    }
-    file.write(reinterpret_cast<const char*>(volume_data.data()), volume_data.size());
-
-    // 写入文件元数据区
-    for (const auto& file_meta : pending_files_) {
-        std::vector<uint8_t> file_data;
-        Serializer::SerializeFileMetadata(file_meta, file_data);
-        file.write(reinterpret_cast<const char*>(file_data.data()), file_data.size());
-
-        // 更新缓存中的文件元数据（volume_id和offset）
-        if (file_metadata_cache_.find(file_meta.inode_id) != file_metadata_cache_.end()) {
-            file_metadata_cache_[file_meta.inode_id].volume_id = volume_meta.volume_id;
-            file_metadata_cache_[file_meta.inode_id].offset_in_volume = file_meta.offset_in_volume;
-        }
-    }
-
-    // 写入目录数据区（空）
-    // 写入用户数据区（使用压缩后的数据）
-    for (const auto& file_meta : pending_files_) {
-        // 读取临时压缩文件内容
-        std::string temp_compressed_path = temp_dir_ + "temp_" + std::to_string(file_meta.inode_id) + ".compressed";
-        std::vector<uint8_t> content;
-        ret = ReadFileContent(temp_compressed_path, content);
-        if (ret != ErrorCode::SUCCESS) {
-            file.close();
-            return ret;
-        }
-
-        // 写入到卷镜像
-        file.write(reinterpret_cast<const char*>(content.data()), content.size());
-
-        // 删除临时压缩文件
-        DeleteFile(temp_compressed_path);
-    }
-
-    file.close();
-
-    // 挂载新创建的卷镜像
-    mounted_volumes_[volume_meta.volume_id] = volume_meta;
-
-    // 清空待封装文件集
-    pending_files_.clear();
-    pending_size_ = 0;
-
-    return ErrorCode::SUCCESS;
+    return PackVolumeInternal(PackTrigger::Manual, output_path);
 }
 
 ErrorCode VolumeManager::MountVolume(const std::string& volume_path) {

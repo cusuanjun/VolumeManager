@@ -13,6 +13,27 @@
 
 namespace volumemanager {
 
+enum class PackTrigger {
+    Manual,
+    AutoThreshold,
+    AutoOverflow
+};
+
+struct PackReport {
+    PackTrigger trigger;
+    ErrorCode result;
+    uint64_t volume_id;
+    std::string volume_path;
+    uint32_t file_count;
+    uint64_t user_data_size;
+};
+
+class IPackReporter {
+public:
+    virtual ~IPackReporter() = default;
+    virtual void OnPackFinished(const PackReport& report) = 0;
+};
+
 /**
  * @brief 卷镜像管理器类
  */
@@ -91,6 +112,11 @@ public:
     uint64_t volume_size_;                          // 卷镜像大小限制
     double size_threshold_;                         // 触发镜像封装的大小阈值（百分比）
 
+    IPackReporter* pack_reporter_ = nullptr;
+
+    ErrorCode PackVolumeInternal(PackTrigger trigger, std::string& output_path);
+    ErrorCode FlushPendingFiles(std::string& output_path);
+
     /**
      * @brief 初始化临时目录
      * @return ErrorCode 操作结果
@@ -121,6 +147,8 @@ public:
      * @return true 如果需要封装
      */
     bool ShouldPackVolume() const;
+
+    void SetPackReporter(IPackReporter* reporter);
 };
 
 } // namespace volumemanager
