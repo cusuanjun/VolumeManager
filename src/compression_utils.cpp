@@ -1,7 +1,7 @@
 #include "compression_utils.h"
+#include "async_file_io.h"
 #include <cstdint>
 #include <zlib.h>
-#include <fstream>
 #include <cstring>
 
 namespace volumemanager {
@@ -77,7 +77,7 @@ ErrorCode CompressionUtils::CompressFile(const std::string& input_path,
                                          const std::string& output_path) {
     // 读取输入文件
     std::vector<uint8_t> input_data;
-    ErrorCode ret = ReadFileContent(input_path, input_data);
+    ErrorCode ret = AsyncReadAll(input_path, input_data);
     if (ret != ErrorCode::SUCCESS) {
         return ret;
     }
@@ -90,28 +90,35 @@ ErrorCode CompressionUtils::CompressFile(const std::string& input_path,
     }
 
     // 写入压缩文件
-    return WriteFileContent(output_path, compressed_data);
+    return AsyncWriteAll(output_path, compressed_data);
 }
 
 ErrorCode CompressionUtils::DecompressFile(const std::string& input_path,
                                            const std::string& output_path) {
+    return DecompressFile(input_path, output_path, 0);
+}
+
+ErrorCode CompressionUtils::DecompressFile(const std::string& input_path,
+                                           const std::string& output_path,
+                                           uint64_t original_size) {
     // 读取压缩文件
     std::vector<uint8_t> compressed_data;
-    ErrorCode ret = ReadFileContent(input_path, compressed_data);
+    ErrorCode ret = AsyncReadAll(input_path, compressed_data);
     if (ret != ErrorCode::SUCCESS) {
         return ret;
     }
 
-    // 注意：这里需要知道原始文件大小，但从压缩文件中无法直接获取
-    // 实际使用时，需要从FileMetadata中获取原始大小
-    // 这里提供一个简化版本，假设文件名中包含原始大小信息
-    // 或者使用zlib的gzip格式（包含原始大小）
+    if (original_size == 0) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
 
-    // 由于zlib的compress/uncompress不存储原始大小，
-    // 我们需要从其他地方（如FileMetadata）获取原始大小
-    // 这里返回错误，需要调用DecompressData并传入原始大小
+    std::vector<uint8_t> decompressed_data;
+    ret = DecompressData(compressed_data, original_size, decompressed_data);
+    if (ret != ErrorCode::SUCCESS) {
+        return ret;
+    }
 
-    return ErrorCode::INVALID_PARAMETER;
+    return AsyncWriteAll(output_path, decompressed_data);
 }
 
 std::string CompressionUtils::GetCompressedFileName(const std::string& original_name) {

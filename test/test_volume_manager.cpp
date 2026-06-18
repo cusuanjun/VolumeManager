@@ -2,16 +2,21 @@
 #include "../include/error_codes.h"
 #include "../include/serializer.h"
 #include "../include/compression_utils.h"
+#include "../include/async_file_io.h"
 #include <iostream>
 #include <cassert>
+#include <algorithm>
 #include <fstream>
+#include <future>
 #include <vector>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 
 using namespace volumemanager;
 
 constexpr const char* TEST_DATA_DIR = "./test_data/";
+constexpr const char* ASYNC_IO_TEST_DIR = "/tmp/volume_manager_async_io";
 
 // 辅助函数：创建测试文件
 void CreateTestFile(const std::string& path, const std::string& content) {
@@ -62,6 +67,268 @@ bool CompareFileContent(const std::string& path1, const std::string& path2) {
     file1.close();
     file2.close();
     return true;
+}
+
+std::vector<uint8_t> MakePatternData(size_t size, uint8_t seed) {
+    std::vector<uint8_t> data(size);
+    for (size_t i = 0; i < size; ++i) {
+        data[i] = static_cast<uint8_t>((seed + i * 31) & 0xFF);
+    }
+    return data;
+}
+
+bool CompareVectors(const std::vector<uint8_t>& lhs, const std::vector<uint8_t>& rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (lhs[i] != rhs[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string JoinPath(const std::string& dir, const std::string& name) {
+    if (!dir.empty() && dir.back() == '/') {
+        return dir + name;
+    }
+    return dir + "/" + name;
+}
+
+void TestAsyncFileIO() {
+    std::cout << "=== 测试6：异步文件I/O基础测试 ===" << std::endl;
+
+    EnsureDirectory(ASYNC_IO_TEST_DIR);
+    const std::string empty_path = JoinPath(ASYNC_IO_TEST_DIR, "empty.bin");
+    const std::string binary_path = JoinPath(ASYNC_IO_TEST_DIR, "binary.bin");
+    const std::string patch_path = JoinPath(ASYNC_IO_TEST_DIR, "patch.bin");
+    const std::string missing_path = JoinPath(ASYNC_IO_TEST_DIR, "missing.bin");
+
+    std::vector<uint8_t> empty_content;
+    ErrorCode ret = AsyncWriteAll(empty_path, empty_content);
+    assert(ret == ErrorCode::SUCCESS);
+
+    std::vector<uint8_t> read_back;
+    ret = AsyncReadAll(empty_path, read_back);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(read_back.empty());
+    std::cout << "空文件读写成功" << std::endl;
+
+    std::vector<uint8_t> original = MakePatternData(4096, 17);
+    ret = AsyncWriteAll(binary_path, original);
+    assert(ret == ErrorCode::SUCCESS);
+
+    read_back.clear();
+    ret = AsyncReadAll(binary_path, read_back);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(CompareVectors(original, read_back));
+    std::cout << "整文件读写成功" << std::endl;
+
+    std::vector<uint8_t> slice;
+    ret = AsyncReadAt(binary_path, 128, 256, slice);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(slice.size() == 256);
+    assert(std::equal(slice.begin(), slice.end(), original.begin() + 128));
+    std::cout << "按偏移读取成功" << std::endl;
+
+    std::vector<uint8_t> tail;
+    ret = AsyncReadAt(binary_path, original.size() - 1, 1, tail);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(tail.size() == 1);
+    assert(tail[0] == original.back());
+    std::cout << "边界偏移读取成功" << std::endl;
+
+    std::vector<uint8_t> out_of_range;
+    ret = AsyncReadAt(binary_path, original.size(), 1, out_of_range);
+    assert(ret == ErrorCode::IO_ERROR);
+    std::cout << "越界读取正确返回错误" << std::endl;
+
+    ret = AsyncReadAll(missing_path, read_back);
+    assert(ret == ErrorCode::FILE_NOT_FOUND);
+    std::cout << "缺失文件读取正确返回错误" << std::endl;
+
+    std::vector<uint8_t> patch_source = MakePatternData(512, 203);
+    ret = AsyncWriteAll(patch_path, original);
+    assert(ret == ErrorCode::SUCCESS);
+
+    ret = AsyncWriteAt(patch_path, 1024, patch_source);
+    assert(ret == ErrorCode::SUCCESS);
+
+    std::vector<uint8_t> patched;
+    ret = AsyncReadAll(patch_path, patched);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(patched.size() == original.size());
+    assert(std::equal(patched.begin(), patched.begin() + 1024, original.begin()));
+    assert(std::equal(patched.begin() + 1024,
+                      patched.begin() + 1024 + patch_source.size(),
+                      patch_source.begin()));
+    assert(std::equal(patched.begin() + 1024 + patch_source.size(),
+                      patched.end(),
+                      original.begin() + 1024 + patch_source.size()));
+    std::cout << "按偏移写入成功" << std::endl;
+
+    ret = AsyncDeleteFile(empty_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(binary_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(patch_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(missing_path);
+    assert(ret == ErrorCode::SUCCESS);
+    std::cout << "文件删除成功" << std::endl;
+
+    std::cout << "测试6通过" << std::endl << std::endl;
+}
+
+void TestAsyncFileIOConcurrency() {
+    std::cout << "=== 测试7：异步文件I/O并发测试 ===" << std::endl;
+
+    EnsureDirectory(ASYNC_IO_TEST_DIR);
+
+    constexpr size_t FILE_COUNT = 12;
+    std::vector<std::string> paths;
+    std::vector<std::vector<uint8_t>> expected_data;
+    paths.reserve(FILE_COUNT);
+    expected_data.reserve(FILE_COUNT);
+
+    for (size_t i = 0; i < FILE_COUNT; ++i) {
+        paths.push_back(JoinPath(ASYNC_IO_TEST_DIR, "concurrent_" + std::to_string(i) + ".bin"));
+        expected_data.push_back(MakePatternData(512 + i * 73, static_cast<uint8_t>(11 + i * 17)));
+    }
+
+    std::vector<std::future<ErrorCode>> write_tasks;
+    for (size_t i = 0; i < FILE_COUNT; ++i) {
+        std::string path = paths[i];
+        std::vector<uint8_t> data = expected_data[i];
+        write_tasks.push_back(std::async(std::launch::async, [path, data]() {
+            return AsyncWriteAll(path, data);
+        }));
+    }
+
+    for (auto& task : write_tasks) {
+        assert(task.get() == ErrorCode::SUCCESS);
+    }
+    std::cout << "并发写文件成功" << std::endl;
+
+    std::vector<std::future<bool>> read_tasks;
+    for (size_t i = 0; i < FILE_COUNT; ++i) {
+        std::string path = paths[i];
+        std::vector<uint8_t> data = expected_data[i];
+        read_tasks.push_back(std::async(std::launch::async, [path, data]() {
+            std::vector<uint8_t> content;
+            if (AsyncReadAll(path, content) != ErrorCode::SUCCESS) {
+                return false;
+            }
+            return CompareVectors(content, data);
+        }));
+    }
+
+    for (auto& task : read_tasks) {
+        assert(task.get());
+    }
+    std::cout << "并发读文件成功" << std::endl;
+
+    const std::string shared_path = JoinPath(ASYNC_IO_TEST_DIR, "shared.bin");
+    std::vector<uint8_t> shared_data = MakePatternData(4096, 91);
+    ErrorCode ret = AsyncWriteAll(shared_path, shared_data);
+    assert(ret == ErrorCode::SUCCESS);
+
+    std::vector<std::pair<uint64_t, uint64_t>> ranges = {
+        {0, 128},
+        {64, 256},
+        {1024, 512},
+        {2048, 1024},
+        {3500, 300}
+    };
+
+    std::vector<std::future<bool>> range_tasks;
+    for (const auto& range : ranges) {
+        const uint64_t offset = range.first;
+        const uint64_t size = range.second;
+        range_tasks.push_back(std::async(std::launch::async, [shared_path, shared_data, offset, size]() {
+            std::vector<uint8_t> chunk;
+            if (AsyncReadAt(shared_path, offset, size, chunk) != ErrorCode::SUCCESS) {
+                return false;
+            }
+            return chunk.size() == size &&
+                   std::equal(chunk.begin(), chunk.end(), shared_data.begin() + offset);
+        }));
+    }
+
+    for (auto& task : range_tasks) {
+        assert(task.get());
+    }
+    std::cout << "并发偏移读取成功" << std::endl;
+
+    std::vector<std::future<ErrorCode>> delete_tasks;
+    for (const auto& path : paths) {
+        delete_tasks.push_back(std::async(std::launch::async, [path]() {
+            return AsyncDeleteFile(path);
+        }));
+    }
+    delete_tasks.push_back(std::async(std::launch::async, [shared_path]() {
+        return AsyncDeleteFile(shared_path);
+    }));
+
+    for (auto& task : delete_tasks) {
+        assert(task.get() == ErrorCode::SUCCESS);
+    }
+    std::cout << "并发删除文件成功" << std::endl;
+
+    std::cout << "测试7通过" << std::endl << std::endl;
+}
+
+void TestCompressionFileRoundTrip() {
+    std::cout << "=== 测试8：压缩文件I/O回环测试 ===" << std::endl;
+
+    EnsureDirectory(ASYNC_IO_TEST_DIR);
+    const std::string source_path = JoinPath(ASYNC_IO_TEST_DIR, "compress_source.txt");
+    const std::string compressed_path = JoinPath(ASYNC_IO_TEST_DIR, "compress_source.txt.compressed");
+    const std::string restored_path = JoinPath(ASYNC_IO_TEST_DIR, "compress_restored.txt");
+    const std::string empty_path = JoinPath(ASYNC_IO_TEST_DIR, "compress_empty.txt");
+    const std::string empty_compressed_path = JoinPath(ASYNC_IO_TEST_DIR, "compress_empty.txt.compressed");
+
+    std::string text = "VolumeManager compression file round trip test.\n";
+    for (int i = 0; i < 20; ++i) {
+        text += "payload_" + std::to_string(i) + "_";
+    }
+    std::vector<uint8_t> source_data(text.begin(), text.end());
+
+    ErrorCode ret = AsyncWriteAll(source_path, source_data);
+    assert(ret == ErrorCode::SUCCESS);
+
+    ret = CompressionUtils::CompressFile(source_path, compressed_path);
+    assert(ret == ErrorCode::SUCCESS);
+
+    ret = CompressionUtils::DecompressFile(compressed_path, restored_path, source_data.size());
+    assert(ret == ErrorCode::SUCCESS);
+    assert(CompareFileContent(source_path, restored_path));
+    std::cout << "普通文件压缩/解压回环成功" << std::endl;
+
+    ret = AsyncWriteAll(empty_path, {});
+    assert(ret == ErrorCode::SUCCESS);
+
+    ret = CompressionUtils::CompressFile(empty_path, empty_compressed_path);
+    assert(ret == ErrorCode::SUCCESS);
+
+    ret = CompressionUtils::DecompressFile(empty_compressed_path, restored_path, 0);
+    assert(ret == ErrorCode::INVALID_PARAMETER);
+    std::cout << "空文件解压参数校验正确" << std::endl;
+
+    ret = AsyncDeleteFile(source_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(compressed_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(restored_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(empty_path);
+    assert(ret == ErrorCode::SUCCESS);
+    ret = AsyncDeleteFile(empty_compressed_path);
+    assert(ret == ErrorCode::SUCCESS);
+    std::cout << "压缩文件I/O测试资源清理成功" << std::endl;
+
+    std::cout << "测试8通过" << std::endl << std::endl;
 }
 
 // 测试1：基本功能测试
@@ -257,9 +524,9 @@ void TestCompression() {
     std::cout << "测试5通过" << std::endl << std::endl;
 }
 
-// 测试6：端到端压缩功能测试
+// 测试9：端到端压缩功能测试
 void TestEndToEndCompression() {
-    std::cout << "=== 测试6：端到端压缩功能测试 ===" << std::endl;
+    std::cout << "=== 测试9：端到端压缩功能测试 ===" << std::endl;
 
     // 创建卷镜像管理器
     VolumeManager manager(2048, 0.9);
@@ -283,7 +550,7 @@ void TestEndToEndCompression() {
     assert(ret == ErrorCode::SUCCESS);
     std::cout << "添加大文件2成功" << std::endl;
 
-    std::cout << "测试6通过" << std::endl << std::endl;
+    std::cout << "测试9通过" << std::endl << std::endl;
 }
 
 int main() {
@@ -297,6 +564,9 @@ int main() {
         TestSerialization();
         TestBoundaryConditions();
         TestCompression();
+        TestAsyncFileIO();
+        TestAsyncFileIOConcurrency();
+        TestCompressionFileRoundTrip();
         TestEndToEndCompression();
 
         std::cout << "========== 所有测试通过！ ==========" << std::endl;

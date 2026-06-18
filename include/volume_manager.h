@@ -2,8 +2,10 @@
 
 #include "volume_metadata.h"
 #include "error_codes.h"
+#include "async_file_io.h"
 #include <string>
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 
 /**
@@ -149,6 +151,10 @@ public:
     bool ShouldPackVolume() const;
 
     void SetPackReporter(IPackReporter* reporter);
+
+private:
+    mutable std::mutex state_mutex_;   // 保护共享元数据和待打包集合
+    mutable std::mutex pack_mutex_;    // 保护打包流程，避免并发封装同一个 pending 集合
 };
 
 } // namespace volumemanager

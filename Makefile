@@ -1,7 +1,7 @@
 # Makefile for VolumeManager
 
 CXX = g++
-CXXFLAGS = -std=c++11 -Wall -Wextra -O2
+CXXFLAGS = -std=c++11 -Wall -Wextra -O2 -pthread
 INCLUDE_DIRS = -I./include
 SRC_DIR = ./src
 TEST_DIR = ./test
@@ -18,6 +18,7 @@ test_unit: $(BUILD_DIR)
 		$(SRC_DIR)/volume_manager.cpp \
 		$(SRC_DIR)/serializer.cpp \
 		$(SRC_DIR)/compression_utils.cpp \
+		$(SRC_DIR)/async_file_io.cpp \
 		$(SRC_DIR)/error_codes.cpp \
 		$(SRC_DIR)/utils.cpp \
 		-lz
@@ -31,6 +32,7 @@ test_e2e: $(BUILD_DIR)
 		$(SRC_DIR)/volume_manager.cpp \
 		$(SRC_DIR)/serializer.cpp \
 		$(SRC_DIR)/compression_utils.cpp \
+		$(SRC_DIR)/async_file_io.cpp \
 		$(SRC_DIR)/error_codes.cpp \
 		$(SRC_DIR)/utils.cpp \
 		-lz

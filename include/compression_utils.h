@@ -36,6 +36,17 @@ public:
                                      const std::string& output_path);
 
     /**
+     * @brief 解压文件（需要原始大小）
+     * @param input_path 输入压缩文件路径
+     * @param output_path 输出解压文件路径
+     * @param original_size 原始文件大小
+     * @return ErrorCode 操作结果
+     */
+    static ErrorCode DecompressFile(const std::string& input_path,
+                                     const std::string& output_path,
+                                     uint64_t original_size);
+
+    /**
      * @brief 压缩数据
      * @param input 输入数据
      * @param output 输出压缩数据

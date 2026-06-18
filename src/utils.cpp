@@ -205,6 +205,7 @@ ErrorCode DeleteFile(const std::string& path) {
 
 // 工具函数：删除目录（递归）
 ErrorCode DeleteDirectory(const std::string& path) {
+    (void)path;
     return ErrorCode::IO_ERROR; // 暂时不实现递归删除
 }
 

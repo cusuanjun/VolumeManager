@@ -3,6 +3,7 @@
 #include <iostream>
 #include <fstream>
 #include <cassert>
+#include <future>
 #include <vector>
 #include <string>
 #include <map>
@@ -608,6 +609,60 @@ void Step9_VerifyAfterRemount(VolumeManager &manager, const std::vector<VolumeIn
 }
 
 /**
+ * @brief 步骤9.5：并发读取文件验证
+ */
+void Step9_ConcurrentReadVerification(VolumeManager& manager)
+{
+    std::cout << "\n=== 步骤9.5：并发读取文件验证 ===" << std::endl;
+
+    std::vector<std::pair<uint64_t, std::string>> file_snapshots;
+    for (const auto& pair : manager.file_metadata_cache_)
+    {
+        file_snapshots.push_back(std::make_pair(pair.first, pair.second.file_name));
+    }
+
+    std::vector<std::future<bool>> tasks;
+    tasks.reserve(file_snapshots.size());
+
+    for (const auto& snapshot : file_snapshots)
+    {
+        uint64_t inode_id = snapshot.first;
+        std::string file_name = snapshot.second;
+        tasks.push_back(std::async(std::launch::async, [&manager, inode_id, file_name]() {
+            std::string output_path;
+            ErrorCode ret = manager.ReadFile(inode_id, output_path);
+            if (ret != ErrorCode::SUCCESS)
+            {
+                std::cout << "并发读取失败: inode=" << inode_id
+                          << ", error=" << GetErrorMessage(ret) << std::endl;
+                return false;
+            }
+
+            std::string original_path = std::string(BASE_PATH) + file_name;
+            return CompareFileContent(original_path, output_path);
+        }));
+    }
+
+    int success_count = 0;
+    for (auto& task : tasks)
+    {
+        if (task.get())
+        {
+            success_count++;
+        }
+    }
+
+    if (success_count == static_cast<int>(file_snapshots.size()))
+    {
+        std::cout << "✓ 并发读取验证完成 (" << success_count << "/" << file_snapshots.size() << ")" << std::endl;
+    }
+    else
+    {
+        throw std::runtime_error("并发读取验证失败");
+    }
+}
+
+/**
  * @brief 步骤10：资源清理
  */
 void Step10_CleanupResources(const std::vector<VolumeInfo> &volume_infos)
@@ -732,6 +787,7 @@ int main()
         // Step4_VerifyMetadata(manager, volume_infos);
 
         Step9_VerifyAfterRemount(manager, volume_infos);
+        Step9_ConcurrentReadVerification(manager);
         Step10_CleanupResources(volume_infos);
         Step11_ManualPackTest();
 
