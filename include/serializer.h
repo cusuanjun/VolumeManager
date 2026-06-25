@@ -48,10 +48,12 @@ public:
      * @brief 反序列化文件元数据
      * @param input 输入二进制数据
      * @param metadata 输出文件元数据
+     * @param volume_version 卷镜像格式版本（v1=50字节固定部分，v2=51字节）
      * @return ErrorCode 操作结果
      */
     static ErrorCode DeserializeFileMetadata(const std::vector<uint8_t>& input,
-                                            FileMetadata& metadata);
+                                            FileMetadata& metadata,
+                                            uint32_t volume_version = CURRENT_VERSION);
 
     /**
      * @brief 验证卷镜像元数据

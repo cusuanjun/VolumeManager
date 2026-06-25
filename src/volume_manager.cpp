@@ -144,7 +144,7 @@ ErrorCode VolumeManager::PackVolumeInternal(PackTrigger trigger, std::string& ou
         }
     }
 
-    // 读取临时压缩文件，读操作并行进行
+    // 读取临时压缩文件，使用线程池并行读取
     struct TempReadResult {
         ErrorCode code = ErrorCode::SUCCESS;
         std::vector<uint8_t> data;
@@ -153,19 +153,23 @@ ErrorCode VolumeManager::PackVolumeInternal(PackTrigger trigger, std::string& ou
         uint64_t inode_id = 0;
     };
 
+    // 根据压缩算法确定临时文件后缀
     std::vector<std::future<TempReadResult>> read_tasks;
     read_tasks.reserve(pending_files_.size());
     for (const auto& file_meta : pending_files_) {
+        std::string suffix = (file_meta.compression_algorithm == CompressionAlgorithm::ZSTD)
+                                 ? ".zst" : ".compressed";
         std::string temp_compressed_path =
-            temp_dir_ + "temp_" + std::to_string(file_meta.inode_id) + ".compressed";
-        read_tasks.push_back(std::async(std::launch::async, [temp_compressed_path, file_meta]() {
-            TempReadResult result;
-            result.temp_path = temp_compressed_path;
-            result.offset = file_meta.offset_in_volume;
-            result.inode_id = file_meta.inode_id;
-            result.code = AsyncReadAll(temp_compressed_path, result.data);
-            return result;
-        }));
+            temp_dir_ + "temp_" + std::to_string(file_meta.inode_id) + suffix;
+        read_tasks.push_back(thread_pool_.Enqueue(
+            [temp_compressed_path, file_meta]() {
+                TempReadResult result;
+                result.temp_path = temp_compressed_path;
+                result.offset = file_meta.offset_in_volume;
+                result.inode_id = file_meta.inode_id;
+                result.code = AsyncReadAll(temp_compressed_path, result.data);
+                return result;
+            }));
     }
 
     std::vector<TempReadResult> read_results;
@@ -178,13 +182,14 @@ ErrorCode VolumeManager::PackVolumeInternal(PackTrigger trigger, std::string& ou
         read_results.push_back(std::move(result));
     }
 
-    // 写入用户数据区，使用带偏移写入，多个文件可以同时落盘
+    // 写入用户数据区，使用线程池并行写入
     std::vector<std::future<ErrorCode>> write_tasks;
     write_tasks.reserve(read_results.size());
     for (const auto& result : read_results) {
-        write_tasks.push_back(std::async(std::launch::async, [output_path, result]() {
-            return AsyncWriteAt(output_path, result.offset, result.data);
-        }));
+        write_tasks.push_back(thread_pool_.Enqueue(
+            [output_path, result]() {
+                return AsyncWriteAt(output_path, result.offset, result.data);
+            }));
     }
 
     for (auto& task : write_tasks) {
@@ -293,11 +298,13 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     metadata.volume_id = INVALID_VOLUME_ID;
     metadata.offset_in_volume = 0;
     metadata.file_name = GetFileName(file_path);
-    metadata.compressed_file_name = CompressionUtils::GetCompressedFileName(metadata.file_name);
+    metadata.compressed_file_name = CompressionUtils::GetCompressedFileName(
+        metadata.file_name, CompressionAlgorithm::ZSTD);
     metadata.file_mode = GetFileMode(full_path);
     metadata.last_modified = GetFileLastModified(full_path);
     metadata.is_directory = false;
     metadata.is_compressed = true;
+    metadata.compression_algorithm = CompressionAlgorithm::ZSTD;
 
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -313,7 +320,7 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     }
 
     std::vector<uint8_t> compressed_content;
-    ret = CompressionUtils::CompressData(original_content, compressed_content);
+    ret = CompressionUtils::CompressDataZstd(original_content, compressed_content);
     if (ret != ErrorCode::SUCCESS) {
         return ret;
     }
@@ -321,7 +328,7 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     metadata.compressed_size = compressed_content.size();
 
     // 保存压缩后的数据到临时文件
-    std::string temp_compressed_path = temp_dir_ + "temp_" + std::to_string(metadata.inode_id) + ".compressed";
+    std::string temp_compressed_path = temp_dir_ + "temp_" + std::to_string(metadata.inode_id) + ".zst";
     ret = AsyncWriteAll(temp_compressed_path, compressed_content);
     if (ret != ErrorCode::SUCCESS) {
         return ret;
@@ -365,6 +372,175 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     }
 
     // 检查是否需要封装卷镜像
+    if (need_pack_threshold) {
+        std::string volume_path;
+        return PackVolumeInternal(PackTrigger::AutoThreshold, volume_path);
+    }
+
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode VolumeManager::AddFilesToCollect(const std::vector<std::string>& file_paths,
+                                            std::vector<uint64_t>& out_inode_ids) {
+    out_inode_ids.clear();
+    if (file_paths.empty()) {
+        return ErrorCode::SUCCESS;
+    }
+
+    // ========================================================================
+    // Step 1: 预校验所有路径并分配 inode_id（持锁，快速完成）
+    // ========================================================================
+    struct FileTask {
+        std::string full_path;
+        FileMetadata metadata;
+    };
+    std::vector<FileTask> tasks;
+    tasks.reserve(file_paths.size());
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        for (const auto& file_path : file_paths) {
+            if (file_path.empty()) {
+                return ErrorCode::INVALID_PATH;
+            }
+
+            std::string full_path = base_path_ + file_path;
+
+            if (!FileExists(full_path)) {
+                return ErrorCode::FILE_NOT_FOUND;
+            }
+            if (IsDirectory(full_path)) {
+                return ErrorCode::INVALID_PATH;
+            }
+
+            FileTask task;
+            task.full_path = full_path;
+            task.metadata.file_size = GetFileSize(full_path);
+            task.metadata.volume_id = INVALID_VOLUME_ID;
+            task.metadata.offset_in_volume = 0;
+            task.metadata.file_name = GetFileName(file_path);
+            task.metadata.compressed_file_name =
+                CompressionUtils::GetCompressedFileName(task.metadata.file_name,
+                                                        CompressionAlgorithm::ZSTD);
+            task.metadata.file_mode = GetFileMode(full_path);
+            task.metadata.last_modified = GetFileLastModified(full_path);
+            task.metadata.is_directory = false;
+            task.metadata.is_compressed = true;
+            task.metadata.compression_algorithm = CompressionAlgorithm::ZSTD;
+            task.metadata.inode_id = GenerateInodeId();
+            tasks.push_back(std::move(task));
+        }
+    }
+
+    // ========================================================================
+    // Step 2: 线程池并行执行 读→压缩→写临时文件（重量操作，在锁外执行）
+    // ========================================================================
+    struct CompressResult {
+        ErrorCode code = ErrorCode::SUCCESS;
+        size_t task_index = 0;
+        uint64_t compressed_size = 0;
+    };
+
+    std::vector<std::future<CompressResult>> futures;
+    futures.reserve(tasks.size());
+
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        futures.push_back(thread_pool_.Enqueue(
+            [this](FileTask task, size_t index) -> CompressResult {
+                CompressResult result;
+                result.task_index = index;
+
+                // 读取原始文件
+                std::vector<uint8_t> original_data;
+                result.code = AsyncReadAll(task.full_path, original_data);
+                if (result.code != ErrorCode::SUCCESS) {
+                    return result;
+                }
+
+                // zstd 压缩
+                std::vector<uint8_t> compressed_data;
+                result.code = CompressionUtils::CompressDataZstd(
+                    original_data, compressed_data);
+                if (result.code != ErrorCode::SUCCESS) {
+                    return result;
+                }
+
+                result.compressed_size = compressed_data.size();
+
+                // 写入临时压缩文件
+                std::string temp_path = this->temp_dir_ + "temp_" +
+                    std::to_string(task.metadata.inode_id) + ".zst";
+                result.code = AsyncWriteAll(temp_path, compressed_data);
+
+                // 无需清理 temp_path——由 PackVolumeInternal 在打包后删除
+                return result;
+            },
+            tasks[i], i));
+    }
+
+    // ========================================================================
+    // Step 3: 收集结果，更新元数据
+    // ========================================================================
+    for (auto& f : futures) {
+        CompressResult r = f.get();
+        if (r.code != ErrorCode::SUCCESS) {
+            return r.code;
+        }
+        tasks[r.task_index].metadata.compressed_size = r.compressed_size;
+    }
+
+    // ========================================================================
+    // Step 4: 加入待封装集合并检查是否需要触发打包
+    // ========================================================================
+    bool need_pack_overflow = false;
+    bool need_pack_threshold = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+
+        for (auto& task : tasks) {
+            // 检查是否超过卷容量
+            if (pending_size_ + task.metadata.compressed_size > volume_size_) {
+                need_pack_overflow = true;
+                break;
+            }
+        }
+    }
+
+    if (need_pack_overflow) {
+        // 当前 pending 集合满，先打包
+        std::string volume_path;
+        ErrorCode ret = PackVolumeInternal(PackTrigger::AutoOverflow, volume_path);
+        if (ret != ErrorCode::SUCCESS) {
+            return ret;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+
+        for (auto& task : tasks) {
+            // 确保单文件不超过卷容量
+            if (task.metadata.compressed_size > volume_size_) {
+                return ErrorCode::VOLUME_FULL;
+            }
+
+            pending_files_.push_back(task.metadata);
+            pending_size_ += task.metadata.compressed_size;
+            file_metadata_cache_[task.metadata.inode_id] = task.metadata;
+        }
+
+        double threshold = static_cast<double>(pending_size_) /
+                          static_cast<double>(volume_size_);
+        need_pack_threshold = (threshold >= size_threshold_);
+    }
+
+    // 填充返回值
+    out_inode_ids.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        out_inode_ids.push_back(task.metadata.inode_id);
+    }
+
     if (need_pack_threshold) {
         std::string volume_path;
         return PackVolumeInternal(PackTrigger::AutoThreshold, volume_path);
@@ -420,11 +596,12 @@ ErrorCode VolumeManager::MountVolume(const std::string& volume_path) {
 
     // 读取文件元数据区
     file.seekg(volume_meta.metadata_offset);
+    // v1: 固定部分50字节, v2: 固定部分51字节（含 compression_algorithm）
+    uint32_t file_meta_fixed_size = (volume_meta.version >= 2) ? 51 : 50;
     for (uint32_t i = 0; i < volume_meta.file_count; ++i) {
-        // 读取文件元数据：固定部分50字节 + 两个字符串
-        // 先读取固定部分：50字节
-        std::vector<uint8_t> temp_data(50);
-        file.read(reinterpret_cast<char*>(temp_data.data()), 50);
+        // 读取文件元数据固定部分
+        std::vector<uint8_t> temp_data(file_meta_fixed_size);
+        file.read(reinterpret_cast<char*>(temp_data.data()), file_meta_fixed_size);
 
         if (!file.good()) {
             file.close();
@@ -479,9 +656,9 @@ ErrorCode VolumeManager::MountVolume(const std::string& volume_path) {
                          reinterpret_cast<const uint8_t*>(&str_len2) + sizeof(uint32_t));
         temp_data.insert(temp_data.end(), compressed_file_name.begin(), compressed_file_name.end());
 
-        // 反序列化文件元数据
+        // 反序列化文件元数据（传入卷版本号以正确处理 v1/v2 格式差异）
         FileMetadata file_meta;
-        ret = Serializer::DeserializeFileMetadata(temp_data, file_meta);
+        ret = Serializer::DeserializeFileMetadata(temp_data, file_meta, volume_meta.version);
         if (ret != ErrorCode::SUCCESS) {
             file.close();
             return ret;
@@ -529,47 +706,65 @@ ErrorCode VolumeManager::UnmountVolume(uint64_t volume_id) {
 }
 
 ErrorCode VolumeManager::ReadFile(uint64_t inode_id, std::string& output_path) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    // 查找文件元数据
-    auto it = file_metadata_cache_.find(inode_id);
-    if (it == file_metadata_cache_.end()) {
-        return ErrorCode::INODE_NOT_FOUND;
+    // 仅在锁内完成元数据查找，拷贝所需字段后在锁外执行 I/O
+    uint64_t volume_id;
+    uint64_t offset_in_volume;
+    uint64_t compressed_size;
+    uint64_t file_size;
+    CompressionAlgorithm algorithm;
+    std::string file_name;
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+
+        auto it = file_metadata_cache_.find(inode_id);
+        if (it == file_metadata_cache_.end()) {
+            return ErrorCode::INODE_NOT_FOUND;
+        }
+
+        const FileMetadata& file_meta = it->second;
+
+        auto volume_it = mounted_volumes_.find(file_meta.volume_id);
+        if (volume_it == mounted_volumes_.end()) {
+            return ErrorCode::VOLUME_NOT_FOUND;
+        }
+
+        // 拷贝 I/O 所需的字段
+        volume_id = volume_it->second.volume_id;
+        offset_in_volume = file_meta.offset_in_volume;
+        compressed_size = file_meta.compressed_size;
+        file_size = file_meta.file_size;
+        algorithm = file_meta.compression_algorithm;
+        file_name = file_meta.file_name;
     }
-
-    const FileMetadata& file_meta = it->second;
-
-    // 检查文件是否属于已挂载的卷镜像
-    auto volume_it = mounted_volumes_.find(file_meta.volume_id);
-    if (volume_it == mounted_volumes_.end()) {
-        // for (auto [k,v] : mounted_volumes_) {
-        //     std::cout << "have" << k << std::endl;
-        // }
-        // std::cout << "no " << file_meta.volume_id << std::endl;
-        return ErrorCode::VOLUME_NOT_FOUND;
-    }
-
-    const VolumeMetadata& volume_meta = volume_it->second;
+    // 锁在此处释放，后续 I/O 不再持锁
 
     // 生成输出文件路径
-    output_path = temp_dir_ + "file_" + std::to_string(inode_id) + "_" + file_meta.file_name;
+    output_path = temp_dir_ + "file_" + std::to_string(inode_id) + "_" + file_name;
 
     // 打开卷镜像文件
-    std::string volume_path = temp_dir_ + "volume_" + std::to_string(volume_meta.volume_id) + ".vimg";
+    std::string volume_path = temp_dir_ + "volume_" + std::to_string(volume_id) + ".vimg";
+
     // 读取压缩文件内容
-    std::vector<uint8_t> compressed_content(file_meta.compressed_size);
+    std::vector<uint8_t> compressed_content(compressed_size);
     ErrorCode ret = AsyncReadAt(volume_path,
-                                file_meta.offset_in_volume,
-                                file_meta.compressed_size,
+                                offset_in_volume,
+                                compressed_size,
                                 compressed_content);
     if (ret != ErrorCode::SUCCESS) {
         return ret;
     }
 
-    // 解压数据
+    // 根据压缩算法解压数据
     std::vector<uint8_t> decompressed_content;
-    ret = CompressionUtils::DecompressData(compressed_content,
-                                           file_meta.file_size,
-                                           decompressed_content);
+    if (algorithm == CompressionAlgorithm::ZSTD) {
+        ret = CompressionUtils::DecompressDataZstd(compressed_content,
+                                                    decompressed_content);
+    } else {
+        ret = CompressionUtils::DecompressData(compressed_content,
+                                               file_size,
+                                               decompressed_content);
+    }
     if (ret != ErrorCode::SUCCESS) {
         return ret;
     }

@@ -21,7 +21,7 @@ test_unit: $(BUILD_DIR)
 		$(SRC_DIR)/async_file_io.cpp \
 		$(SRC_DIR)/error_codes.cpp \
 		$(SRC_DIR)/utils.cpp \
-		-lz
+		-lz -lzstd
 	@echo "编译完成，运行单元测试..."
 	@$(BUILD_DIR)/test_volume_manager
 
@@ -35,15 +35,29 @@ test_e2e: $(BUILD_DIR)
 		$(SRC_DIR)/async_file_io.cpp \
 		$(SRC_DIR)/error_codes.cpp \
 		$(SRC_DIR)/utils.cpp \
-		-lz
+		-lz -lzstd
 	@echo "编译完成，运行端到端测试..."
 	@$(BUILD_DIR)/test_e2e
 
 # 编译所有测试
 test: test_unit test_e2e
 
+# 性能基准测试（不包含在默认 test 中，因为耗时较长）
+benchmark: $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDE_DIRS) -o $(BUILD_DIR)/benchmark \
+		$(TEST_DIR)/benchmark.cpp \
+		$(SRC_DIR)/volume_manager.cpp \
+		$(SRC_DIR)/serializer.cpp \
+		$(SRC_DIR)/compression_utils.cpp \
+		$(SRC_DIR)/async_file_io.cpp \
+		$(SRC_DIR)/error_codes.cpp \
+		$(SRC_DIR)/utils.cpp \
+		-lz -lzstd
+	@echo "编译完成，运行性能基准测试..."
+	@$(BUILD_DIR)/benchmark
+
 # 清理构建文件
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: test test_unit test_e2e clean
+.PHONY: test test_unit test_e2e benchmark clean

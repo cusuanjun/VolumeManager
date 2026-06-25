@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compression_utils.h"
 #include <cstdint>
 #include <ctime>
 #include <string>
@@ -14,7 +15,9 @@ namespace volumemanager {
 // 魔数标识 "VIMG"
 constexpr uint64_t MAGIC_NUMBER = 0x56494D47ULL;
 // 当前卷镜像格式版本号
-constexpr uint32_t CURRENT_VERSION = 1;
+//   v1: zlib 压缩，FileMetadata 固定部分 50 字节
+//   v2: zstd 压缩（默认），FileMetadata 固定部分 51 字节（新增 compression_algorithm）
+constexpr uint32_t CURRENT_VERSION = 2;
 // 非法卷镜像ID
 constexpr uint64_t INVALID_VOLUME_ID = 0ULL;
 // 非法inode ID
@@ -68,6 +71,7 @@ struct FileMetadata {
     time_t last_modified;            // 最后修改时间（st_mtime）
     bool is_directory;               // 是否为目录
     bool is_compressed;              // 是否为压缩文件
+    CompressionAlgorithm compression_algorithm;  // 压缩算法（v2 新增）
 
     /**
      * @brief 构造函数，初始化默认值
@@ -81,7 +85,8 @@ struct FileMetadata {
         , file_mode(0)
         , last_modified(0)
         , is_directory(false)
-        , is_compressed(false) {}
+        , is_compressed(false)
+        , compression_algorithm(CompressionAlgorithm::ZSTD) {}
 };
 
 } // namespace volumemanager

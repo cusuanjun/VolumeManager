@@ -153,12 +153,13 @@ ErrorCode Serializer::ReadString(const std::vector<uint8_t>& input,
 
 ErrorCode Serializer::SerializeFileMetadata(const FileMetadata& metadata,
                                               std::vector<uint8_t>& output) {
-    // 固定部分：inode_id(8) + file_size(8) + compressed_size(8) + volume_id(8) +
-    //                     offset_in_volume(4) + file_mode(4) + last_modified(8) +
-    //           is_directory(1) + is_compressed(1) = 50字节
-    uint32_t fixed_size = 8 + 8 + 8 + 8 + 4 + 4 + 8 + 1 + 1;
-    output.reserve(fixed_size);
+    // v2 固定部分：inode_id(8) + file_size(8) + compressed_size(8) + volume_id(8) +
+    //              offset_in_volume(4) + file_mode(4) + last_modified(8) +
+    //              is_directory(1) + is_compressed(1) + compression_algorithm(1) = 51字节
+    // v1 固定部分：同上但不含 compression_algorithm = 50字节
+    constexpr uint32_t FIXED_SIZE_V2 = 8 + 8 + 8 + 8 + 4 + 4 + 8 + 1 + 1 + 1;
     output.clear();
+    output.reserve(FIXED_SIZE_V2);
 
     // 写入inode_id（8字节）
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&metadata.inode_id);
@@ -195,6 +196,9 @@ ErrorCode Serializer::SerializeFileMetadata(const FileMetadata& metadata,
     // 写入is_compressed（1字节）
     output.push_back(metadata.is_compressed ? 1 : 0);
 
+    // 写入compression_algorithm（1字节，v2 新增）
+    output.push_back(static_cast<uint8_t>(metadata.compression_algorithm));
+
     // 写入file_name（字符串）
     WriteString(metadata.file_name, output);
 
@@ -205,9 +209,15 @@ ErrorCode Serializer::SerializeFileMetadata(const FileMetadata& metadata,
 }
 
 ErrorCode Serializer::DeserializeFileMetadata(const std::vector<uint8_t>& input,
-                                              FileMetadata& metadata) {
-    // 固定部分：50字节
-    uint32_t fixed_size = 8 + 8 + 8 + 8 + 4 + 4 + 8 + 1 + 1;
+                                              FileMetadata& metadata,
+                                              uint32_t volume_version) {
+    // v2 固定部分：51字节（含 compression_algorithm）
+    // v1 固定部分：50字节（不含 compression_algorithm）
+    constexpr uint32_t FIXED_SIZE_V2 = 8 + 8 + 8 + 8 + 4 + 4 + 8 + 1 + 1 + 1;
+    constexpr uint32_t FIXED_SIZE_V1 = FIXED_SIZE_V2 - 1;
+
+    uint32_t fixed_size = (volume_version >= 2) ? FIXED_SIZE_V2 : FIXED_SIZE_V1;
+
     if (input.size() < fixed_size) {
         return ErrorCode::SERIALIZATION_ERROR;
     }
@@ -232,7 +242,6 @@ ErrorCode Serializer::DeserializeFileMetadata(const std::vector<uint8_t>& input,
 
     // 读取volume_id（8字节）
     std::memcpy(&metadata.volume_id, ptr, sizeof(uint64_t));
-    // std::cout << "还原的volume_id" << metadata.volume_id << std::endl;
     ptr += sizeof(uint64_t);
     offset += sizeof(uint64_t);
 
@@ -259,6 +268,14 @@ ErrorCode Serializer::DeserializeFileMetadata(const std::vector<uint8_t>& input,
     metadata.is_compressed = (input[offset] != 0);
     offset += 1;
 
+    // 读取compression_algorithm（1字节，v2 新增；v1 默认 zlib）
+    if (volume_version >= 2) {
+        metadata.compression_algorithm = static_cast<CompressionAlgorithm>(input[offset]);
+        offset += 1;
+    } else {
+        metadata.compression_algorithm = CompressionAlgorithm::ZLIB;
+    }
+
     // 读取file_name（字符串）
     ErrorCode ret = ReadString(input, offset, metadata.file_name);
     if (ret != ErrorCode::SUCCESS) {
@@ -276,8 +293,8 @@ bool Serializer::ValidateVolumeMetadata(const VolumeMetadata& metadata) {
         return false;
     }
 
-    // 验证版本号
-    if (metadata.version != CURRENT_VERSION) {
+    // 验证版本号（支持 v1 和 v2）
+    if (metadata.version < 1 || metadata.version > CURRENT_VERSION) {
         return false;
     }
 

@@ -3,6 +3,7 @@
 #include "volume_metadata.h"
 #include "error_codes.h"
 #include "async_file_io.h"
+#include "thread_pool.h"
 #include <string>
 #include <unordered_map>
 #include <mutex>
@@ -65,6 +66,15 @@ public:
      */
     ErrorCode AddFileToCollect(const std::string& file_path);
     ErrorCode AddFileToCollect(const std::string& file_path, uint64_t& inode_id);
+
+    /**
+     * @brief 批量将文件纳入待封装文件集（并行处理，利用线程池加速）
+     * @param file_paths 文件相对路径列表
+     * @param out_inode_ids 输出每个文件对应的 inode_id
+     * @return ErrorCode 操作结果（首个失败即中止）
+     */
+    ErrorCode AddFilesToCollect(const std::vector<std::string>& file_paths,
+                                std::vector<uint64_t>& out_inode_ids);
 
     /**
      * @brief 根据inode_id读取文件内容
@@ -155,6 +165,7 @@ public:
 private:
     mutable std::mutex state_mutex_;   // 保护共享元数据和待打包集合
     mutable std::mutex pack_mutex_;    // 保护打包流程，避免并发封装同一个 pending 集合
+    ThreadPool thread_pool_;           // 线程池，用于压缩/I/O 并行化
 };
 
 } // namespace volumemanager

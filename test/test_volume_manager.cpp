@@ -10,6 +10,8 @@
 #include <future>
 #include <vector>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -424,11 +426,12 @@ void TestSerialization() {
     file_meta.volume_id = 12345678;
     file_meta.offset_in_volume = 200;
     file_meta.file_name = "test.txt";
-    file_meta.compressed_file_name = "test.txt.compressed";
+    file_meta.compressed_file_name = "test.txt.zst";
     file_meta.file_mode = 0644;
     file_meta.last_modified = 1234567890;
     file_meta.is_directory = false;
     file_meta.is_compressed = true;
+    file_meta.compression_algorithm = CompressionAlgorithm::ZSTD;
 
     std::vector<uint8_t> file_serialized;
     ret = Serializer::SerializeFileMetadata(file_meta, file_serialized);
@@ -514,12 +517,22 @@ void TestCompression() {
     // 测试文件名转换
     std::string original_name = "test.txt";
     std::string compressed_name = CompressionUtils::GetCompressedFileName(original_name);
-    assert(compressed_name == "test.txt.compressed");
-    std::cout << "压缩文件名生成正确" << std::endl;
+    assert(compressed_name == "test.txt.zst");
+    std::cout << "zstd压缩文件名生成正确" << std::endl;
+
+    // 显式指定 zlib
+    std::string compressed_zlib = CompressionUtils::GetCompressedFileName(
+        original_name, CompressionAlgorithm::ZLIB);
+    assert(compressed_zlib == "test.txt.compressed");
+    std::cout << "zlib压缩文件名生成正确" << std::endl;
 
     std::string recovered_name = CompressionUtils::GetOriginalFileName(compressed_name);
     assert(recovered_name == original_name);
-    std::cout << "原始文件名恢复正确" << std::endl;
+    std::cout << "zstd原始文件名恢复正确" << std::endl;
+
+    std::string recovered_zlib = CompressionUtils::GetOriginalFileName(compressed_zlib);
+    assert(recovered_zlib == original_name);
+    std::cout << "zlib原始文件名恢复正确" << std::endl;
 
     std::cout << "测试5通过" << std::endl << std::endl;
 }
@@ -553,10 +566,113 @@ void TestEndToEndCompression() {
     std::cout << "测试9通过" << std::endl << std::endl;
 }
 
+// 测试10：ThreadPool 测试
+void TestThreadPool() {
+    std::cout << "=== 测试10：ThreadPool 基础测试 ===" << std::endl;
+
+    // 基础任务提交
+    ThreadPool pool(4);
+    std::cout << "线程池大小: " << pool.Size() << std::endl;
+    assert(pool.Size() == 4);
+
+    auto future = pool.Enqueue([](int x) { return x * 2; }, 42);
+    assert(future.get() == 84);
+    std::cout << "基础任务提交成功" << std::endl;
+
+    // 并发任务测试
+    constexpr int TASK_COUNT = 20;
+    std::vector<std::future<int>> futures;
+    futures.reserve(TASK_COUNT);
+    for (int i = 0; i < TASK_COUNT; ++i) {
+        futures.push_back(pool.Enqueue([](int val) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return val * val;
+        }, i));
+    }
+
+    for (int i = 0; i < TASK_COUNT; ++i) {
+        assert(futures[i].get() == i * i);
+    }
+    std::cout << "并发任务测试通过 (" << TASK_COUNT << " 个任务)" << std::endl;
+
+    // 默认大小
+    ThreadPool default_pool;
+    assert(default_pool.Size() > 0);
+    std::cout << "默认线程池大小: " << default_pool.Size() << std::endl;
+
+    std::cout << "测试10通过" << std::endl << std::endl;
+}
+
+// 测试11：zstd 压缩/解压测试
+void TestZstdCompression() {
+    std::cout << "=== 测试11：zstd 压缩/解压测试 ===" << std::endl;
+
+    // 回环测试
+    std::string test_data = "这是一段用于测试zstd压缩功能的文本数据，应当能够被正确压缩和解压。";
+    std::vector<uint8_t> original_data(test_data.begin(), test_data.end());
+
+    std::vector<uint8_t> compressed_data;
+    ErrorCode ret = CompressionUtils::CompressDataZstd(original_data, compressed_data);
+    assert(ret == ErrorCode::SUCCESS);
+    std::cout << "zstd数据压缩成功，原始大小: " << original_data.size()
+              << ", 压缩后大小: " << compressed_data.size() << std::endl;
+
+    std::vector<uint8_t> decompressed_data;
+    ret = CompressionUtils::DecompressDataZstd(compressed_data, decompressed_data);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(decompressed_data.size() == original_data.size());
+    for (size_t i = 0; i < original_data.size(); ++i) {
+        assert(decompressed_data[i] == original_data[i]);
+    }
+    std::cout << "zstd数据解压成功，数据一致" << std::endl;
+
+    // 空输入测试
+    std::vector<uint8_t> empty;
+    std::vector<uint8_t> empty_compressed;
+    ret = CompressionUtils::CompressDataZstd(empty, empty_compressed);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(empty_compressed.empty());
+
+    std::vector<uint8_t> empty_decompressed;
+    ret = CompressionUtils::DecompressDataZstd(empty_compressed, empty_decompressed);
+    assert(ret == ErrorCode::SUCCESS);
+    assert(empty_decompressed.empty());
+    std::cout << "zstd空输入处理正确" << std::endl;
+
+    // 不同压缩级别
+    std::vector<uint8_t> pattern = MakePatternData(4096, 42);
+    for (int level : {1, 3, 10, 22}) {
+        std::vector<uint8_t> compressed;
+        ret = CompressionUtils::CompressDataZstd(pattern, compressed, level);
+        assert(ret == ErrorCode::SUCCESS);
+
+        std::vector<uint8_t> decompressed;
+        ret = CompressionUtils::DecompressDataZstd(compressed, decompressed);
+        assert(ret == ErrorCode::SUCCESS);
+        assert(CompareVectors(pattern, decompressed));
+    }
+    std::cout << "zstd多级别压缩测试通过（级别 1, 3, 10, 22）" << std::endl;
+
+    // 文件名后缀检测
+    assert(CompressionUtils::GetAlgorithmFromFileName("test.txt.zst") ==
+           CompressionAlgorithm::ZSTD);
+    assert(CompressionUtils::GetAlgorithmFromFileName("test.txt.compressed") ==
+           CompressionAlgorithm::ZLIB);
+    assert(CompressionUtils::GetAlgorithmFromFileName("test.txt") ==
+           CompressionAlgorithm::ZLIB);  // 未知后缀默认 zlib
+    assert(CompressionUtils::IsCompressedFileName("test.txt.zst"));
+    assert(CompressionUtils::IsCompressedFileName("test.txt.compressed"));
+    assert(!CompressionUtils::IsCompressedFileName("test.txt"));
+    std::cout << "文件名后缀检测正确" << std::endl;
+
+    std::cout << "测试11通过" << std::endl << std::endl;
+}
+
 int main() {
     std::cout << "========== 卷镜像管理系统单元测试 ==========" << std::endl << std::endl;
 
     EnsureDirectory(TEST_DATA_DIR);
+    EnsureDirectory(ASYNC_IO_TEST_DIR);
 
     try {
         TestBasicFunction();
@@ -568,6 +684,8 @@ int main() {
         TestAsyncFileIOConcurrency();
         TestCompressionFileRoundTrip();
         TestEndToEndCompression();
+        TestThreadPool();
+        TestZstdCompression();
 
         std::cout << "========== 所有测试通过！ ==========" << std::endl;
         return 0;
